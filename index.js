@@ -1,4 +1,13 @@
 const { Client, GatewayIntentBits, Collection, EmbedBuilder } = require('discord.js');
+const http = require('http'); // 1. Ye line add ki
+
+// --- RENDER PORT FIX (Fake Web Server) ---
+const server = http.createServer((req, res) => {
+    res.writeHead(200);
+    res.end('Bot is alive!');
+});
+server.listen(process.env.PORT || 3000); // Render ka port sunega
+// ------------------------------------------
 
 const client = new Client({
     intents: [
@@ -9,23 +18,21 @@ const client = new Client({
     ]
 });
 
-// --- SETTINGS (Yahan Role IDs add kar di hain) ---
+// --- SETTINGS ---
 const CONFIG = {
     TOKEN: process.env.TOKEN, 
-    WELCOME_CHANNEL: "WELCOME_CHANNEL_ID_YAHA_DALO", 
-    RULES_CHANNEL: "RULES_CHANNEL_ID_YAHA_DALO",     
+    WELCOME_CHANNEL: "1440722692243198072", // Tumhari ID 1 (Check kar lena ye channel ID hai na?)
+    RULES_CHANNEL: "1440017250345291918",   // Tumhari ID 2
     PREFIX: "!",
-    // Ye rahi tumhari Admin Role IDs
     ADMIN_ROLES: ["1440722692243198072", "1440017250345291918"] 
 };
 
 const inviteCache = new Collection();
 
-// --- 1. Bot Start (Data Sync) ---
+// --- 1. Bot Start ---
 client.on('ready', async () => {
     console.log(`✅ ${client.user.tag} is online & tracking invites!`);
 
-    // Discord se data fetch karke sync kar lo
     for (const [guildId, guild] of client.guilds.cache) {
         try {
             const currentInvites = await guild.invites.fetch();
@@ -37,14 +44,13 @@ client.on('ready', async () => {
     }
 });
 
-// --- 2. Welcome & Tracker Logic ---
+// --- 2. Welcome Logic ---
 client.on('guildMemberAdd', async (member) => {
     const channel = member.guild.channels.cache.get(CONFIG.WELCOME_CHANNEL);
     
     const newInvites = await member.guild.invites.fetch();
     const oldInvites = inviteCache.get(member.guild.id);
     
-    // Check increase in count
     const invite = newInvites.find(i => i.uses > (oldInvites.get(i.code) || 0));
 
     let inviterMention = "Unknown";
@@ -57,7 +63,6 @@ client.on('guildMemberAdd', async (member) => {
 
     const memberCount = member.guild.memberCount;
 
-    // --- Message Format ---
     const welcomeEmbed = new EmbedBuilder()
         .setColor('#0099ff')
         .setTitle('📥 New Member Joined')
@@ -95,10 +100,6 @@ client.on('messageCreate', async (message) => {
     const args = message.content.slice(CONFIG.PREFIX.length).trim().split(/ +/);
     const command = args.shift().toLowerCase();
 
-    // Helper function: Check Admin
-    const isAdmin = message.member.roles.cache.some(role => CONFIG.ADMIN_ROLES.includes(role.id));
-
-    // COMMAND: !invites (Sabke liye open hai)
     if (command === 'invites' || command === 'myinvites') {
         const targetUser = message.mentions.users.first() || message.author;
         
@@ -121,13 +122,7 @@ client.on('messageCreate', async (message) => {
         return message.channel.send({ embeds: [inviteEmbed] });
     }
 
-    // COMMAND: !leaderboard (Agar sirf ADMINS ke liye rakhna hai to niche wali line uncomment kar dena)
     if (command === 'leaderboard' || command === 'lb') {
-        
-        // --- ADMIN CHECK (Optional: Agar chaho to hata sakte ho) ---
-        // if (!isAdmin) return message.reply("Ye command sirf Admins use kar sakte hain!");
-        // -----------------------------------------------------------
-
         const invites = await message.guild.invites.fetch();
         const inviteCounter = {};
 
@@ -159,3 +154,4 @@ client.on('messageCreate', async (message) => {
 });
 
 client.login(CONFIG.TOKEN);
+
