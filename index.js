@@ -1,4 +1,3 @@
-
 const {
   Client,
   GatewayIntentBits,
@@ -7,18 +6,12 @@ const {
 } = require("discord.js");
 const { createClient } = require("@supabase/supabase-js");
 const http = require("http");
-const fetch = (...args) =>
-  import("node-fetch").then(({ default: fetch }) => fetch(...args));
 
-/* ───────── KEEP ALIVE ───────── */
+/* ───────── KEEP ALIVE (RENDER FREE) ───────── */
 http.createServer((req, res) => {
   res.writeHead(200);
   res.end("Bot alive");
 }).listen(process.env.PORT || 3000);
-
-setInterval(() => {
-  fetch(`http://localhost:${process.env.PORT || 3000}`);
-}, 5 * 60 * 1000);
 
 /* ───────── SUPABASE ───────── */
 const supabase = createClient(
@@ -26,7 +19,7 @@ const supabase = createClient(
   process.env.SUPABASE_SERVICE_ROLE_KEY
 );
 
-/* ───────── CLIENT ───────── */
+/* ───────── DISCORD CLIENT ───────── */
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
@@ -37,10 +30,34 @@ const client = new Client({
 
 const inviteCache = new Collection();
 
-/* ───────── READY ───────── */
+/* ───────── READY + AUTO SLASH DEPLOY ───────── */
 client.once("ready", async () => {
   console.log(`✅ Logged in as ${client.user.tag}`);
 
+  /* 🔥 AUTO DEPLOY SLASH COMMANDS */
+  const commands = [
+    {
+      name: "invites",
+      description: "Check invite count",
+      options: [
+        {
+          name: "user",
+          description: "User to check",
+          type: 6, // USER
+          required: false
+        }
+      ]
+    },
+    {
+      name: "leaderboard",
+      description: "Top inviters"
+    }
+  ];
+
+  await client.application.commands.set(commands);
+  console.log("⚡ Slash commands auto-deployed");
+
+  /* INVITE CACHE + BASELINE SYNC */
   for (const guild of client.guilds.cache.values()) {
     const invites = await guild.invites.fetch();
     inviteCache.set(
@@ -57,14 +74,14 @@ client.once("ready", async () => {
       });
     }
 
-    // baseline sync (existing members)
+    // Existing members baseline (inviter unknown)
     const members = await guild.members.fetch();
     for (const member of members.values()) {
       await supabase.from("invite_history").upsert({
         guild_id: guild.id,
         joined_user_id: member.id,
         inviter_id: "unknown"
-      }, { onConflict: "guild_id,joined_user_id" });
+      });
     }
   }
 });
@@ -89,7 +106,6 @@ client.on("guildMemberAdd", async member => {
 
   if (!usedInvite || !usedInvite.inviter) return;
 
-  // save join
   await supabase.from("joins").insert({
     guild_id: member.guild.id,
     user_id: member.id,
@@ -97,17 +113,15 @@ client.on("guildMemberAdd", async member => {
     code: usedInvite.code
   });
 
-  // stats update
   await supabase.from("invite_stats").upsert({
     guild_id: member.guild.id,
     inviter_id: usedInvite.inviter.id,
     total_invites: 1,
     real_invites: 1
-  }, { onConflict: "guild_id,inviter_id", increment: ["total_invites", "real_invites"] });
-
+  });
 });
 
-/* ───────── MEMBER LEAVE ───────── */
+/* ───────── MEMBER LEAVE (−1 LOGIC) ───────── */
 client.on("guildMemberRemove", async member => {
   const { data } = await supabase
     .from("joins")
@@ -120,7 +134,6 @@ client.on("guildMemberRemove", async member => {
 
   const joinedAt = new Date(data.joined_at);
   const diffHours = (Date.now() - joinedAt.getTime()) / 36e5;
-
   const isFake = diffHours < 24;
 
   await supabase.from("invite_stats").upsert({
@@ -129,7 +142,7 @@ client.on("guildMemberRemove", async member => {
     total_invites: -1,
     fake_invites: isFake ? 1 : 0,
     leaves: 1
-  }, { onConflict: "guild_id,inviter_id", increment: ["total_invites", "fake_invites", "leaves"] });
+  });
 
   await supabase.from("member_leaves").insert({
     guild_id: member.guild.id,
@@ -140,7 +153,7 @@ client.on("guildMemberRemove", async member => {
   });
 });
 
-/* ───────── SLASH COMMANDS ───────── */
+/* ───────── SLASH COMMAND HANDLER ───────── */
 client.on("interactionCreate", async interaction => {
   if (!interaction.isChatInputCommand()) return;
 
@@ -154,9 +167,9 @@ client.on("interactionCreate", async interaction => {
       .eq("inviter_id", user.id)
       .maybeSingle();
 
-    return interaction.reply({
-      content: `📨 **${user.tag}** has **${data?.total_invites || 0}** invites`
-    });
+    return interaction.reply(
+      `📨 **${user.tag}** has **${data?.total_invites || 0}** invites`
+    );
   }
 
   if (interaction.commandName === "leaderboard") {
@@ -167,10 +180,11 @@ client.on("interactionCreate", async interaction => {
       .order("total_invites", { ascending: false })
       .limit(10);
 
-    if (!data?.length) return interaction.reply("No data yet.");
+    if (!data?.length)
+      return interaction.reply("No invite data yet.");
 
     const text = data
-      .map((u, i) => `#${i + 1} <@${u.inviter_id}> — ${u.total_invites}`)
+      .map((u, i) => `**#${i + 1}** <@${u.inviter_id}> — ${u.total_invites}`)
       .join("\n");
 
     const embed = new EmbedBuilder()
@@ -178,7 +192,7 @@ client.on("interactionCreate", async interaction => {
       .setDescription(text)
       .setColor(0xf1c40f);
 
-    interaction.reply({ embeds: [embed] });
+    return interaction.reply({ embeds: [embed] });
   }
 });
 
