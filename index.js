@@ -1,14 +1,14 @@
-const { Client, GatewayIntentBits, Collection, EmbedBuilder } = require('discord.js');
-const http = require('http'); // 1. Ye line add ki
+const { Client, GatewayIntentBits, Collection, EmbedBuilder, PermissionsBitField } = require('discord.js');
+const http = require('http');
 
-// --- RENDER PORT FIX (Fake Web Server) ---
+// --- RENDER KEEP-ALIVE ---
 const server = http.createServer((req, res) => {
     res.writeHead(200);
-    res.end('Bot is alive!');
+    res.end('Bot is working!');
 });
-server.listen(process.env.PORT || 3000); // Render ka port sunega
-// ------------------------------------------
+server.listen(process.env.PORT || 3000);
 
+// --- BOT CLIENT ---
 const client = new Client({
     intents: [
         GatewayIntentBits.Guilds,
@@ -18,39 +18,47 @@ const client = new Client({
     ]
 });
 
-// --- SETTINGS ---
-const CONFIG = {
+// --- SETTINGS (DATA STORE) ---
+// Yahan hum variables bana rahe hain jo tum command se set karoge
+let CONFIG = {
     TOKEN: process.env.TOKEN, 
-    WELCOME_CHANNEL: "1440722692243198072", // Tumhari ID 1 (Check kar lena ye channel ID hai na?)
-    RULES_CHANNEL: "1440017250345291918",   // Tumhari ID 2
     PREFIX: "!",
-    ADMIN_ROLES: ["1440722692243198072", "1440017250345291918"] 
+    // Ye rahi tumhari ADMIN ROLE IDs (Ab sahi jagah hain)
+    ADMIN_ROLES: ["1440722692243198072", "1440017250345291918"],
+    
+    // Ye abhi empty hain, tum command se set karoge
+    WELCOME_CHANNEL: null, 
+    RULES_CHANNEL: null    
 };
 
 const inviteCache = new Collection();
 
-// --- 1. Bot Start ---
+// --- 1. READY EVENT ---
 client.on('ready', async () => {
-    console.log(`✅ ${client.user.tag} is online & tracking invites!`);
-
+    console.log(`✅ ${client.user.tag} online hai!`);
+    
+    // Current Invites Save karo
     for (const [guildId, guild] of client.guilds.cache) {
         try {
             const currentInvites = await guild.invites.fetch();
             inviteCache.set(guildId, new Collection(currentInvites.map(invite => [invite.code, invite.uses])));
-            console.log(`📥 ${guild.name}: Invites synced (Data Safe).`);
+            console.log(`📥 ${guild.name}: Invites tracked.`);
         } catch (err) {
-            console.log(`❌ Error fetching invites for ${guild.name}`);
+            console.log(`❌ Error: ${guild.name} me invites fetch nahi huye.`);
         }
     }
 });
 
-// --- 2. Welcome Logic ---
+// --- 2. MEMBER JOIN LOGIC ---
 client.on('guildMemberAdd', async (member) => {
+    // Agar Welcome Channel set nahi hai to kuch mat karo
+    if (!CONFIG.WELCOME_CHANNEL) return;
+
     const channel = member.guild.channels.cache.get(CONFIG.WELCOME_CHANNEL);
-    
+    if (!channel) return;
+
     const newInvites = await member.guild.invites.fetch();
     const oldInvites = inviteCache.get(member.guild.id);
-    
     const invite = newInvites.find(i => i.uses > (oldInvites.get(i.code) || 0));
 
     let inviterMention = "Unknown";
@@ -61,29 +69,29 @@ client.on('guildMemberAdd', async (member) => {
         inviteCode = invite.code;
     }
 
-    const memberCount = member.guild.memberCount;
+    // Rules Channel Mention Logic
+    const rulesText = CONFIG.RULES_CHANNEL ? `<#${CONFIG.RULES_CHANNEL}>` : "Rules Channel";
 
     const welcomeEmbed = new EmbedBuilder()
         .setColor('#0099ff')
         .setTitle('📥 New Member Joined')
-        .setDescription(`Swagat hai ${member}! Please read rules in <#${CONFIG.RULES_CHANNEL}>.`)
+        .setDescription(`Swagat hai ${member}! Please read rules in ${rulesText}.`)
         .addFields(
             { name: 'Discord User', value: `${member} (\`${member.id}\`)`, inline: false },
             { name: 'Invited By', value: `${inviterMention}`, inline: false },
             { name: 'Invite Code', value: `\`${inviteCode}\``, inline: true },
-            { name: 'Member Count', value: `#${memberCount}`, inline: true }
+            { name: 'Member Count', value: `#${member.guild.memberCount}`, inline: true }
         )
         .setThumbnail(member.user.displayAvatarURL())
         .setTimestamp();
 
-    if (channel) {
-        channel.send({ embeds: [welcomeEmbed] });
-    }
+    channel.send({ embeds: [welcomeEmbed] });
 
+    // Cache Update
     inviteCache.set(member.guild.id, new Collection(newInvites.map(i => [i.code, i.uses])));
 });
 
-// --- 3. Cache Updates ---
+// --- 3. INVITE TRACKING ---
 client.on('inviteCreate', (invite) => {
     const invites = inviteCache.get(invite.guild.id);
     if (invites) invites.set(invite.code, invite.uses);
@@ -93,23 +101,56 @@ client.on('inviteDelete', (invite) => {
     if (invites) invites.delete(invite.code);
 });
 
-// --- 4. Commands ---
+// --- 4. COMMANDS ---
 client.on('messageCreate', async (message) => {
     if (message.author.bot || !message.content.startsWith(CONFIG.PREFIX)) return;
 
     const args = message.content.slice(CONFIG.PREFIX.length).trim().split(/ +/);
     const command = args.shift().toLowerCase();
 
+    // Helper: Check Admin Role
+    const isAdmin = message.member.roles.cache.some(role => CONFIG.ADMIN_ROLES.includes(role.id)) || message.member.permissions.has(PermissionsBitField.Flags.Administrator);
+
+    // --- COMMAND: SET WELCOME (Admin Only) ---
+    if (command === 'setwelcome') {
+        if (!isAdmin) return message.reply("❌ Sirf Admin/Owner ye kar sakte hain.");
+        
+        const channel = message.mentions.channels.first();
+        if (!channel) return message.reply("❌ Kripya channel mention karein. Example: `!setwelcome #general`");
+
+        CONFIG.WELCOME_CHANNEL = channel.id;
+
+        const embed = new EmbedBuilder()
+            .setColor('#00FF00')
+            .setDescription(`✅ **Welcome Channel Set!**\nAb se welcome messages ${channel} me aayenge.`);
+        return message.channel.send({ embeds: [embed] });
+    }
+
+    // --- COMMAND: SET RULES (Admin Only) ---
+    if (command === 'setrules') {
+        if (!isAdmin) return message.reply("❌ Sirf Admin/Owner ye kar sakte hain.");
+
+        const channel = message.mentions.channels.first();
+        if (!channel) return message.reply("❌ Kripya channel mention karein. Example: `!setrules #rules`");
+
+        CONFIG.RULES_CHANNEL = channel.id;
+
+        const embed = new EmbedBuilder()
+            .setColor('#00FF00')
+            .setDescription(`✅ **Rules Channel Set!**\nNew members ko ${channel} check karne ko bola jayega.`);
+        return message.channel.send({ embeds: [embed] });
+    }
+
+    // --- COMMAND: INVITES ---
     if (command === 'invites' || command === 'myinvites') {
         const targetUser = message.mentions.users.first() || message.author;
-        
         const invites = await message.guild.invites.fetch();
         const userInvites = invites.filter(i => i.inviter && i.inviter.id === targetUser.id);
         
         let totalUses = 0;
         userInvites.forEach(invite => totalUses += invite.uses);
 
-        const inviteEmbed = new EmbedBuilder()
+        const embed = new EmbedBuilder()
             .setColor('#2b2d31')
             .setAuthor({ name: 'Invitation Stats', iconURL: targetUser.displayAvatarURL() })
             .addFields(
@@ -117,11 +158,11 @@ client.on('messageCreate', async (message) => {
                 { name: 'Total Invites', value: `**${totalUses}**`, inline: false },
                 { name: 'Active Codes', value: `${userInvites.size}`, inline: false }
             )
-            .setFooter({ text: 'Data from Discord API' });
-
-        return message.channel.send({ embeds: [inviteEmbed] });
+            .setFooter({ text: 'Tracking active invites only' });
+        return message.channel.send({ embeds: [embed] });
     }
 
+    // --- COMMAND: LEADERBOARD ---
     if (command === 'leaderboard' || command === 'lb') {
         const invites = await message.guild.invites.fetch();
         const inviteCounter = {};
@@ -143,15 +184,13 @@ client.on('messageCreate', async (message) => {
 
         if (!lbString) lbString = "No invites found yet.";
 
-        const lbEmbed = new EmbedBuilder()
+        const embed = new EmbedBuilder()
             .setColor('#FFD700')
             .setTitle('🏆 Invitation Leaderboard')
             .setDescription(lbString)
             .setTimestamp();
-
-        return message.channel.send({ embeds: [lbEmbed] });
+        return message.channel.send({ embeds: [embed] });
     }
 });
 
 client.login(CONFIG.TOKEN);
-
