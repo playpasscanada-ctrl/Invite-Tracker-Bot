@@ -1,7 +1,6 @@
-
 /*****************************************************************************************
- * 🚀 PRO INVITE TRACKER — SUPABASE EDITION (IMPROVED)
- * Merged & Optimized by Gemini
+ * 🚀 PRO INVITE TRACKER — SUPABASE EDITION (FIXED)
+ * Description fields added to fix Error 50035
  *****************************************************************************************/
 
 const {
@@ -23,7 +22,6 @@ http.createServer((req, res) => {
 }).listen(process.env.PORT || 3000);
 
 // --- 2. SUPABASE CONNECTION ---
-// Make sure .env has SUPABASE_URL and SUPABASE_KEY
 const supabase = createClient(
     process.env.SUPABASE_URL,
     process.env.SUPABASE_KEY
@@ -35,7 +33,7 @@ const client = new Client({
         GatewayIntentBits.Guilds,
         GatewayIntentBits.GuildMembers,
         GatewayIntentBits.GuildInvites,
-        GatewayIntentBits.MessageContent // Important for commands
+        GatewayIntentBits.MessageContent
     ],
     partials: [Partials.GuildMember]
 });
@@ -49,7 +47,6 @@ function isAdmin(member) {
 
 // --- REWARD SYSTEM (Auto Role) ---
 async function checkRewards(guild, inviterId) {
-    // 1. Get stats
     const { data: stats } = await supabase
         .from("invite_stats")
         .select("*")
@@ -59,7 +56,6 @@ async function checkRewards(guild, inviterId) {
 
     if (!stats) return;
 
-    // 2. Get configured rewards
     const { data: rewards } = await supabase
         .from("invite_rewards")
         .select("*")
@@ -67,13 +63,11 @@ async function checkRewards(guild, inviterId) {
 
     if (!rewards || rewards.length === 0) return;
 
-    // 3. Check logic
     const member = await guild.members.fetch(inviterId).catch(() => null);
-    if (!member) return; // Inviter left server
+    if (!member) return;
 
     for (const reward of rewards) {
         if (stats.real_invites >= reward.invites_required) {
-            // Check if already given
             const { data: already } = await supabase
                 .from("reward_logs")
                 .select("*")
@@ -84,7 +78,6 @@ async function checkRewards(guild, inviterId) {
 
             if (already) continue;
 
-            // Give Role
             if (reward.reward_type === "role") {
                 const role = guild.roles.cache.get(reward.role_id);
                 if (role) {
@@ -93,7 +86,6 @@ async function checkRewards(guild, inviterId) {
                 }
             }
 
-            // Log it
             await supabase.from("reward_logs").insert({
                 guild_id: guild.id,
                 user_id: inviterId,
@@ -108,7 +100,7 @@ async function checkRewards(guild, inviterId) {
 client.once("ready", async () => {
     console.log(`✅ Logged in as ${client.user.tag}`);
 
-    // --- REGISTER SLASH COMMANDS ---
+    // --- REGISTER SLASH COMMANDS (FIXED DESCRIPTIONS) ---
     const commands = [
         {
             name: "config",
@@ -118,15 +110,18 @@ client.once("ready", async () => {
                     name: "setchannel",
                     description: "Set Welcome Channel",
                     type: 1, // Subcommand
-                    options: [{ name: "channel", type: 7, required: true }]
+                    options: [
+                        // FIX: Description added here
+                        { name: "channel", type: 7, required: true, description: "Select the welcome channel" }
+                    ]
                 },
                 {
                     name: "addreward",
                     description: "Add Invite Reward Role",
                     type: 1,
                     options: [
-                        { name: "invites", type: 4, required: true, description: "How many invites?" },
-                        { name: "role", type: 8, required: true, description: "Which role?" }
+                        { name: "invites", type: 4, required: true, description: "Number of invites required" },
+                        { name: "role", type: 8, required: true, description: "Role to give" }
                     ]
                 }
             ]
@@ -134,7 +129,10 @@ client.once("ready", async () => {
         {
             name: "invites",
             description: "Check your or someone's invites",
-            options: [{ name: "user", type: 6, required: false }]
+            options: [
+                // FIX: Description added here
+                { name: "user", type: 6, required: false, description: "Select user to check" }
+            ]
         },
         {
             name: "leaderboard",
@@ -161,27 +159,19 @@ client.once("ready", async () => {
 client.on("guildMemberAdd", async member => {
     const newInvites = await member.guild.invites.fetch();
     const oldInvites = inviteCache.get(member.guild.id);
-
-    // Find used invite
     const usedInvite = newInvites.find(i => i.uses > (oldInvites.get(i.code) || 0));
 
-    // Update Cache
     inviteCache.set(member.guild.id, new Collection(newInvites.map(i => [i.code, i.uses])));
 
-    // Defaults
     let inviterId = null;
     let code = "Unknown";
-    let inviterTag = "Unknown";
 
     if (usedInvite) {
         inviterId = usedInvite.inviter?.id;
-        inviterTag = usedInvite.inviter?.tag;
         code = usedInvite.code;
     }
 
-    // --- DB UPDATES ---
     if (inviterId) {
-        // 1. Log Join
         await supabase.from("joins").insert({
             guild_id: member.guild.id,
             user_id: member.id,
@@ -189,12 +179,6 @@ client.on("guildMemberAdd", async member => {
             code: code
         });
 
-        // 2. Update Inviter Stats
-        const { error } = await supabase.rpc('increment_invites', { 
-            // Note: Make sure to create this RPC or use simpler update logic below
-        });
-        
-        // Simpler Update Logic (Fetch -> Calc -> Update)
         const { data: existing } = await supabase.from("invite_stats").select("*").eq("guild_id", member.guild.id).eq("inviter_id", inviterId).maybeSingle();
         
         const currentReal = (existing?.real_invites || 0) + 1;
@@ -207,18 +191,16 @@ client.on("guildMemberAdd", async member => {
             real_invites: currentReal
         });
 
-        // 3. Check Rewards
         await checkRewards(member.guild, inviterId);
     }
 
-    // --- WELCOME MESSAGE (Squid Game Style) ---
     const { data: config } = await supabase.from("guild_config").select("*").eq("guild_id", member.guild.id).maybeSingle();
     
     if (config?.welcome_channel) {
         const channel = member.guild.channels.cache.get(config.welcome_channel);
         if (channel) {
             const embed = new EmbedBuilder()
-                .setColor('#0099ff') // Blue
+                .setColor('#0099ff')
                 .setTitle('📥 New Member Joined')
                 .setDescription(`Welcome ${member}!`)
                 .addFields(
@@ -237,7 +219,6 @@ client.on("guildMemberAdd", async member => {
 
 // --- MEMBER LEAVE ---
 client.on("guildMemberRemove", async member => {
-    // Check who invited them
     const { data: join } = await supabase
         .from("joins")
         .select("*")
@@ -246,7 +227,6 @@ client.on("guildMemberRemove", async member => {
         .maybeSingle();
 
     if (join && join.inviter_id) {
-        // Update Stats (Real invites -1)
         const { data: stats } = await supabase.from("invite_stats").select("*").eq("guild_id", member.guild.id).eq("inviter_id", join.inviter_id).maybeSingle();
         
         if (stats) {
@@ -262,7 +242,6 @@ client.on("guildMemberRemove", async member => {
 client.on("interactionCreate", async interaction => {
     if (!interaction.isChatInputCommand()) return;
 
-    // /config
     if (interaction.commandName === "config") {
         if (!isAdmin(interaction.member)) return interaction.reply({ content: "❌ Admins only.", ephemeral: true });
         
@@ -287,7 +266,6 @@ client.on("interactionCreate", async interaction => {
         }
     }
 
-    // /invites
     if (interaction.commandName === "invites") {
         const user = interaction.options.getUser("user") || interaction.user;
 
@@ -310,7 +288,6 @@ client.on("interactionCreate", async interaction => {
         return interaction.reply({ embeds: [embed] });
     }
 
-    // /leaderboard
     if (interaction.commandName === "leaderboard") {
         const { data } = await supabase
             .from("invite_stats")
@@ -332,7 +309,6 @@ client.on("interactionCreate", async interaction => {
     }
 });
 
-// --- TRACKER EVENTS ---
 client.on('inviteCreate', (invite) => {
     const invites = inviteCache.get(invite.guild.id);
     if (invites) invites.set(invite.code, invite.uses);
@@ -343,3 +319,4 @@ client.on('inviteDelete', (invite) => {
 });
 
 client.login(process.env.TOKEN);
+
