@@ -1,6 +1,6 @@
 /*****************************************************************************************
- * 🚀 PRO INVITE TRACKER — STABLE EDITION
- * Fixes: Rate Limit Crash (Opcode 8) & Sync Loop
+ * 🚀 PRO INVITE TRACKER — SYNC FIX + LEAVE MSG + DM
+ * Fixed: Sync Loop, Added Leave Msg & DM Welcome
  *****************************************************************************************/
 
 const {
@@ -18,7 +18,7 @@ const { createClient } = require("@supabase/supabase-js");
 const http = require("http");
 const https = require("https");
 
-// --- 1. KEEP ALIVE (24/7) ---
+// --- 1. KEEP ALIVE ---
 http.createServer((req, res) => { res.writeHead(200); res.end("Bot Awake"); }).listen(process.env.PORT || 3000);
 setInterval(() => {
     const url = process.env.RENDER_EXTERNAL_URL || `http://localhost:${process.env.PORT || 3000}`;
@@ -31,13 +31,15 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY
 
 // --- 3. DISCORD CLIENT ---
 const client = new Client({
-    intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers, GatewayIntentBits.GuildInvites, GatewayIntentBits.MessageContent],
-    partials: [Partials.GuildMember]
+    intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers, GatewayIntentBits.GuildInvites, GatewayIntentBits.MessageContent, GatewayIntentBits.DirectMessages],
+    partials: [Partials.GuildMember, Partials.Channel]
 });
 
 const inviteCache = new Collection();
+// Local Set to stop Sync Loop (Temporary Memory)
+const recentlySynced = new Set(); 
 
-// --- 4. CONFIG VARS ---
+// --- 4. DEFAULTS ---
 const DEFAULT_TITLE = "Swagat hai {user}!";
 const DEFAULT_DESC = `You are member **#{count}**! Invited by {inviter}.\n
 📜 **Read Rules:** <#1440014653273931787>
@@ -67,7 +69,6 @@ function isAdmin(member) {
 client.once("ready", async () => {
     console.log(`✅ Logged in as ${client.user.tag}`);
 
-    // SLASH COMMANDS
     const commands = [
         {
             name: "config",
@@ -75,61 +76,45 @@ client.once("ready", async () => {
             options: [
                 {
                     name: "setchannel",
-                    description: "Set Welcome Channel",
+                    description: "Set Welcome/Leave Channel",
                     type: 1, 
-                    options: [{ name: "channel", type: 7, required: true, description: "Select welcome channel" }]
+                    options: [{ name: "channel", type: 7, required: true, description: "Select channel" }]
                 },
                 {
                     name: "setmessage",
-                    description: "Set Custom Welcome Message",
+                    description: "Set Welcome Message",
                     type: 1,
                     options: [
-                        { name: "title", type: 3, required: true, description: "Title ({user}, {count})" },
-                        { name: "description", type: 3, required: true, description: "Body ({user}, {inviter}, {count})" }
+                        { name: "title", type: 3, required: true, description: "Title" },
+                        { name: "description", type: 3, required: true, description: "Body" }
                     ]
                 },
                 {
                     name: "addreward",
-                    description: "Add Invite Reward Role",
+                    description: "Add Reward",
                     type: 1,
                     options: [
                         { name: "invites", type: 4, required: true, description: "Invites needed" },
-                        { name: "role", type: 8, required: true, description: "Role to give" }
+                        { name: "role", type: 8, required: true, description: "Role" }
                     ]
                 }
             ]
         },
-        {
-            name: "syncmissing",
-            description: "Admin: Fix missing invite data",
-        },
-        {
-            name: "whoinvited",
-            description: "Check who invited a specific user",
-            options: [{ name: "user", type: 6, required: true, description: "Select the user" }]
-        },
-        {
-            name: "invites",
-            description: "Check detailed invite stats",
-            options: [{ name: "user", type: 6, required: false, description: "User to check" }]
-        },
-        {
-            name: "leaderboard",
-            description: "Top 10 Inviters"
-        }
+        { name: "syncmissing", description: "Admin: Fix missing invite data" },
+        { name: "whoinvited", description: "Check who invited a user", options: [{ name: "user", type: 6, required: true, description: "Select user" }] },
+        { name: "invites", description: "Check detailed stats", options: [{ name: "user", type: 6, required: false, description: "Select user" }] },
+        { name: "leaderboard", description: "Top 10 Inviters" }
     ];
 
     await client.application.commands.set(commands);
     console.log("⚡ Slash commands deployed!");
 
-    // CACHE SYNC & MEMBER FETCH (Safe Start)
     for (const guild of client.guilds.cache.values()) {
         try {
             await guild.invites.fetch().then(invites => {
                 inviteCache.set(guild.id, new Collection(invites.map(i => [i.code, i.uses])));
             });
-            // Fetch members once at startup to fill cache
-            await guild.members.fetch().catch(() => console.log(`⚠️ Member fetch skipped for ${guild.name}`));
+            await guild.members.fetch().catch(() => {});
         } catch (e) { console.log(`❌ No perms: ${guild.name}`); }
     }
 });
@@ -146,82 +131,103 @@ client.on("guildMemberAdd", async member => {
 
     if (inviterId) {
         await supabase.from("joins").insert({ guild_id: member.guild.id, user_id: member.id, inviter_id: inviterId, code: code });
-        
         const { data: existing } = await supabase.from("invite_stats").select("*").eq("guild_id", member.guild.id).eq("inviter_id", inviterId).maybeSingle();
-        const currentReal = (existing?.real_invites || 0) + 1;
-        const currentTotal = (existing?.total_invites || 0) + 1;
-
         await supabase.from("invite_stats").upsert({
             guild_id: member.guild.id, inviter_id: inviterId,
-            total_invites: currentTotal, real_invites: currentReal,
+            total_invites: (existing?.total_invites || 0) + 1, real_invites: (existing?.real_invites || 0) + 1,
             fake_invites: existing?.fake_invites || 0, leaves: existing?.leaves || 0
         });
-
         await checkRewards(member.guild, inviterId);
     }
 
-    // Welcome Message
+    // --- WELCOME & DM LOGIC ---
     const { data: config } = await supabase.from("guild_config").select("*").eq("guild_id", member.guild.id).maybeSingle();
     
+    // 1. Channel Message
     if (config?.welcome_channel) {
         const channel = member.guild.channels.cache.get(config.welcome_channel);
         if (channel) {
-            const titleRaw = config.welcome_title || DEFAULT_TITLE;
-            const descRaw = config.welcome_desc || DEFAULT_DESC;
-            const title = formatMessage(titleRaw, member, inviterId, code);
-            const desc = formatMessage(descRaw, member, inviterId, code);
-
-            const embed = new EmbedBuilder()
-                .setColor('#0099ff')
-                .setTitle(title)
-                .setDescription(desc)
-                .setThumbnail(member.user.displayAvatarURL())
-                .setFooter({ text: `Member #${member.guild.memberCount}` })
-                .setTimestamp();
+            const title = formatMessage(config.welcome_title || DEFAULT_TITLE, member, inviterId, code);
+            const desc = formatMessage(config.welcome_desc || DEFAULT_DESC, member, inviterId, code);
             
+            const embed = new EmbedBuilder().setColor('#0099ff').setTitle(title).setDescription(desc)
+                .setThumbnail(member.user.displayAvatarURL()).setFooter({ text: `Member #${member.guild.memberCount}` }).setTimestamp();
             channel.send({ embeds: [embed] });
         }
     }
+
+    // 2. DM Message
+    try {
+        const dmEmbed = new EmbedBuilder()
+            .setColor('#FF00FF') // Pink for DM
+            .setTitle(`Welcome to ${member.guild.name}! 🚀`)
+            .setDescription(`Hello **${member.user.username}**!\nThanks for joining us.\n\nMake sure to verify and check <#1440014653273931787> for rules!`)
+            .setFooter({ text: "Happy Gaming!" });
+        await member.send({ embeds: [dmEmbed] });
+    } catch (e) {
+        console.log(`❌ Could not DM ${member.user.tag} (DMs Closed)`);
+    }
 });
 
-// --- MEMBER LEAVE ---
+// --- MEMBER LEAVE (NEW) ---
 client.on("guildMemberRemove", async member => {
+    // DB Update
     const { data: join } = await supabase.from("joins").select("*").eq("guild_id", member.guild.id).eq("user_id", member.id).maybeSingle();
     if (join && join.inviter_id) {
         const { data: stats } = await supabase.from("invite_stats").select("*").eq("guild_id", member.guild.id).eq("inviter_id", join.inviter_id).maybeSingle();
         if (stats) {
             await supabase.from("invite_stats").update({
-                real_invites: (stats.real_invites || 1) - 1,
-                leaves: (stats.leaves || 0) + 1
+                real_invites: (stats.real_invites || 1) - 1, leaves: (stats.leaves || 0) + 1
             }).eq("guild_id", member.guild.id).eq("inviter_id", join.inviter_id);
+        }
+    }
+
+    // LEAVE MESSAGE (Same Channel)
+    const { data: config } = await supabase.from("guild_config").select("*").eq("guild_id", member.guild.id).maybeSingle();
+    if (config?.welcome_channel) {
+        const channel = member.guild.channels.cache.get(config.welcome_channel);
+        if (channel) {
+            const leaveEmbed = new EmbedBuilder()
+                .setColor('#FF0000') // Red
+                .setTitle('👋 Goodbye!')
+                .setDescription(`**${member.user.tag}** left the server. We missed you!`)
+                .setFooter({ text: `Members: ${member.guild.memberCount}` })
+                .setTimestamp();
+            channel.send({ embeds: [leaveEmbed] });
         }
     }
 });
 
 // --- INTERACTIONS ---
 client.on("interactionCreate", async interaction => {
-    // SYNC SELECT MENU (FIXED LOGIC)
+    // --- SYNC FIX LOGIC ---
     if (interaction.isUserSelectMenu() && interaction.customId === 'sync_select_inviter') {
         if (!isAdmin(interaction.member)) return interaction.reply({ content: "❌ Admins only.", ephemeral: true });
         
         const selectedInviterId = interaction.values[0];
         const targetUserId = interaction.message.embeds[0].footer.text.replace("TargetID: ", "");
         
-        // Defer update immediately to prevent timeout
+        // Mark as synced LOCALLY immediately
+        recentlySynced.add(targetUserId);
+
         await interaction.deferUpdate();
+
+        // Save to DB (Upsert to prevent errors)
+        const { error } = await supabase.from("joins").upsert({ guild_id: interaction.guild.id, user_id: targetUserId, inviter_id: selectedInviterId, code: "manual" });
         
-        // 1. Save to DB
-        await supabase.from("joins").insert({ guild_id: interaction.guild.id, user_id: targetUserId, inviter_id: selectedInviterId, code: "manual" });
+        if (error) {
+            console.log("DB Error:", error);
+            // Even if DB fails, we skip this user in next step to prevent loop
+        } else {
+            // Update Stats only if DB save worked
+            const { data: existing } = await supabase.from("invite_stats").select("*").eq("guild_id", interaction.guild.id).eq("inviter_id", selectedInviterId).maybeSingle();
+            await supabase.from("invite_stats").upsert({
+                guild_id: interaction.guild.id, inviter_id: selectedInviterId,
+                total_invites: (existing?.total_invites || 0) + 1, real_invites: (existing?.real_invites || 0) + 1
+            });
+        }
         
-        // 2. Update Stats
-        const { data: existing } = await supabase.from("invite_stats").select("*").eq("guild_id", interaction.guild.id).eq("inviter_id", selectedInviterId).maybeSingle();
-        await supabase.from("invite_stats").upsert({
-            guild_id: interaction.guild.id, inviter_id: selectedInviterId,
-            total_invites: (existing?.total_invites || 0) + 1,
-            real_invites: (existing?.real_invites || 0) + 1
-        });
-        
-        // 3. Move to next user (NO FETCHING ALL MEMBERS AGAIN)
+        // Next
         await checkNextMissingUser(interaction);
     }
 
@@ -230,116 +236,76 @@ client.on("interactionCreate", async interaction => {
     if (interaction.commandName === "whoinvited") {
         const target = interaction.options.getUser("user");
         const { data: joinData } = await supabase.from("joins").select("*").eq("guild_id", interaction.guild.id).eq("user_id", target.id).maybeSingle();
-
-        if (!joinData) return interaction.reply({ content: `❌ No record found for **${target.username}**.`, ephemeral: true });
-
-        const inviterId = joinData.inviter_id;
-        const code = joinData.code;
-        const joinDate = `<t:${Math.floor(new Date(joinData.joined_at).getTime() / 1000)}:F>`;
-
-        const embed = new EmbedBuilder()
-            .setColor('#FFA500')
-            .setAuthor({ name: `Invite Detail: ${target.username}`, iconURL: target.displayAvatarURL() })
-            .addFields(
-                { name: '👤 Invited By', value: `<@${inviterId}>`, inline: true },
-                { name: '🎟️ Code', value: `\`${code}\``, inline: true },
-                { name: '📅 Joined At', value: joinDate, inline: false }
-            );
-        return interaction.reply({ embeds: [embed] });
+        if (!joinData) return interaction.reply({ content: `❌ No record for **${target.username}**.`, ephemeral: true });
+        return interaction.reply({ embeds: [new EmbedBuilder().setColor('#FFA500').addFields({ name: 'Invited By', value: `<@${joinData.inviter_id}>` }, { name: 'Code', value: `\`${joinData.code}\`` })] });
     }
 
     if (interaction.commandName === "invites") {
         const user = interaction.options.getUser("user") || interaction.user;
         const { data } = await supabase.from("invite_stats").select("*").eq("guild_id", interaction.guild.id).eq("inviter_id", user.id).maybeSingle();
-
-        const real = data?.real_invites || 0;
-        const total = data?.total_invites || 0;
-        const fake = data?.fake_invites || 0;
-        const leaves = data?.leaves || 0;
-
-        const embed = new EmbedBuilder()
-            .setColor('#2b2d31')
-            .setAuthor({ name: `${user.username}'s Invites`, iconURL: user.displayAvatarURL() })
-            .setDescription(`**Total Real Invites: ${real}**`)
-            .addFields(
-                { name: '✅ Real', value: `${real}`, inline: true },
-                { name: '❌ Fake', value: `${fake}`, inline: true },
-                { name: '🚪 Left', value: `${leaves}`, inline: true },
-                { name: '📊 Total', value: `${total}`, inline: true }
-            )
-            .setFooter({ text: 'Real = Total - Fake - Leaves' });
-        return interaction.reply({ embeds: [embed] });
+        return interaction.reply({ embeds: [new EmbedBuilder().setColor('#2b2d31').addFields({ name: '✅ Real', value: `${data?.real_invites || 0}`, inline: true }, { name: '📊 Total', value: `${data?.total_invites || 0}`, inline: true }, { name: '❌ Fake', value: `${data?.fake_invites || 0}`, inline: true }, { name: '🚪 Left', value: `${data?.leaves || 0}`, inline: true })] });
     }
 
-    // SYNC COMMAND
     if (interaction.commandName === "syncmissing") {
         if (!isAdmin(interaction.member)) return interaction.reply({ content: "❌ Admins only.", ephemeral: true });
-        
-        await interaction.reply({ content: "🔎 Searching for missing data...", ephemeral: true });
-        
-        // Fetch ONCE at start of command to ensure we have latest data
-        if (interaction.guild.memberCount > interaction.guild.members.cache.size) {
-            await interaction.guild.members.fetch(); 
-        }
+        recentlySynced.clear(); // Clear cache for new sync session
+        await interaction.reply({ content: "🔎 Searching...", ephemeral: true });
+        if (interaction.guild.memberCount > interaction.guild.members.cache.size) await interaction.guild.members.fetch(); 
         await checkNextMissingUser(interaction);
     }
 
-    // CONFIG & LEADERBOARD (Same as before)
     if (interaction.commandName === "config") {
+        // (Existing config logic same as before, keeping short)
         if (!isAdmin(interaction.member)) return interaction.reply({ content: "❌ Admins only.", ephemeral: true });
         const sub = interaction.options.getSubcommand();
         if (sub === "setchannel") {
             const ch = interaction.options.getChannel("channel");
             await supabase.from("guild_config").upsert({ guild_id: interaction.guild.id, welcome_channel: ch.id });
-            return interaction.reply(`✅ Welcome channel set to ${ch}`);
+            return interaction.reply(`✅ Welcome/Leave channel set to ${ch}`);
         }
         if (sub === "setmessage") {
-            const title = interaction.options.getString("title");
-            const desc = interaction.options.getString("description");
+            // (Same as before)
+            const title = interaction.options.getString("title"); const desc = interaction.options.getString("description");
             const { data: existing } = await supabase.from("guild_config").select("welcome_channel").eq("guild_id", interaction.guild.id).maybeSingle();
             await supabase.from("guild_config").upsert({ guild_id: interaction.guild.id, welcome_channel: existing?.welcome_channel, welcome_title: title, welcome_desc: desc });
-            return interaction.reply(`✅ **Message Updated!**`);
+            return interaction.reply(`✅ Message Updated!`);
         }
         if (sub === "addreward") {
-            const invites = interaction.options.getInteger("invites");
-            const role = interaction.options.getRole("role");
+            const invites = interaction.options.getInteger("invites"); const role = interaction.options.getRole("role");
             await supabase.from("invite_rewards").insert({ guild_id: interaction.guild.id, invites_required: invites, role_id: role.id });
-            return interaction.reply(`✅ Reward Added: **${invites}** -> ${role}`);
+            return interaction.reply(`✅ Reward Added.`);
         }
     }
 
     if (interaction.commandName === "leaderboard") {
         const { data } = await supabase.from("invite_stats").select("*").eq("guild_id", interaction.guild.id).order("real_invites", { ascending: false }).limit(10);
-        const lb = data?.map((u, i) => `**#${i + 1}** <@${u.inviter_id}> : **${u.real_invites}**`).join("\n") || "No data.";
+        const lb = data?.map((u, i) => `**#${i + 1}** <@${u.inviter_id}>: ${u.real_invites}`).join("\n") || "No data.";
         return interaction.reply({ embeds: [new EmbedBuilder().setColor('#FFD700').setTitle('🏆 Leaderboard').setDescription(lb)] });
     }
 });
 
-// --- HELPER: SYNC (Optimized: Uses Cache) ---
 async function checkNextMissingUser(interactionOrMessage) {
     const guild = interactionOrMessage.guild;
-    
-    // IMPORTANT: Use cache instead of fetching all members again
     const members = guild.members.cache; 
     
+    // FETCH DB DATA
     const { data: joins } = await supabase.from("joins").select("user_id").eq("guild_id", guild.id);
     const recordedIds = new Set(joins?.map(j => j.user_id));
     
-    // Find missing member
-    const missingMember = members.find(m => !m.user.bot && !recordedIds.has(m.id));
+    // Find missing member WHO IS NOT IN 'recentlySynced'
+    const missingMember = members.find(m => 
+        !m.user.bot && 
+        !recordedIds.has(m.id) && 
+        !recentlySynced.has(m.id) // <--- CRITICAL FIX
+    );
 
     if (!missingMember) {
-        const embed = new EmbedBuilder().setColor('#00FF00').setTitle('✅ All Synced!').setDescription("All members recorded.");
+        const embed = new EmbedBuilder().setColor('#00FF00').setTitle('✅ Sync Complete!').setDescription("All members synced.");
         if (interactionOrMessage.editReply) return interactionOrMessage.editReply({ content: null, embeds: [embed], components: [] });
         return interactionOrMessage.channel.send({ embeds: [embed] });
     }
 
-    const embed = new EmbedBuilder()
-        .setColor('#FFA500')
-        .setTitle('⚠️ Missing Invite Data')
-        .setDescription(`**User:** ${missingMember} (${missingMember.user.tag})\nSelect who invited them:`)
-        .setFooter({ text: `TargetID: ${missingMember.id}` }); 
-
+    const embed = new EmbedBuilder().setColor('#FFA500').setTitle('⚠️ Missing Data').setDescription(`**User:** ${missingMember} (${missingMember.user.tag})\nSelect inviter:`).setFooter({ text: `TargetID: ${missingMember.id}` }); 
     const row = new ActionRowBuilder().addComponents(new UserSelectMenuBuilder().setCustomId('sync_select_inviter').setPlaceholder('Select Inviter...').setMaxValues(1));
     
     if (interactionOrMessage.editReply) await interactionOrMessage.editReply({ content: null, embeds: [embed], components: [row] });
@@ -347,13 +313,13 @@ async function checkNextMissingUser(interactionOrMessage) {
 }
 
 async function checkRewards(guild, inviterId) {
+    // (Existing Reward Logic)
     const { data: stats } = await supabase.from("invite_stats").select("*").eq("guild_id", guild.id).eq("inviter_id", inviterId).maybeSingle();
     if (!stats) return;
     const { data: rewards } = await supabase.from("invite_rewards").select("*").eq("guild_id", guild.id);
     if (!rewards) return;
     const member = await guild.members.fetch(inviterId).catch(() => null);
     if (!member) return;
-
     for (const reward of rewards) {
         if (stats.real_invites >= reward.invites_required) {
             const { data: already } = await supabase.from("reward_logs").select("*").eq("guild_id", guild.id).eq("user_id", inviterId).eq("invites_required", reward.invites_required).maybeSingle();
@@ -365,26 +331,13 @@ async function checkRewards(guild, inviterId) {
     }
 }
 
-// EVENTS & ANTI-CRASH
-client.on('inviteCreate', (invite) => {
-    const invites = inviteCache.get(invite.guild.id);
-    if (invites) invites.set(invite.code, invite.uses);
-});
-client.on('inviteDelete', (invite) => {
-    const invites = inviteCache.get(invite.guild.id);
-    if (invites) invites.delete(invite.code);
-});
+// EVENTS
+client.on('inviteCreate', (invite) => { const invites = inviteCache.get(invite.guild.id); if (invites) invites.set(invite.code, invite.uses); });
+client.on('inviteDelete', (invite) => { const invites = inviteCache.get(invite.guild.id); if (invites) invites.delete(invite.code); });
 
-// SAFETY NET (ANTI-CRASH)
-process.on('unhandledRejection', (reason, p) => {
-    console.log(' [Anti-Crash] Unhandled Rejection/Error:', reason);
-});
-process.on('uncaughtException', (err, origin) => {
-    console.log(' [Anti-Crash] Uncaught Exception:', err);
-});
-process.on('uncaughtExceptionMonitor', (err, origin) => {
-    console.log(' [Anti-Crash] Uncaught Exception Monitor:', err);
-});
+// ANTI-CRASH
+process.on('unhandledRejection', (r) => console.log('Err:', r));
+process.on('uncaughtException', (e) => console.log('Err:', e));
 
 client.login(process.env.TOKEN);
 
