@@ -1,6 +1,6 @@
 /*****************************************************************************************
- * 🚀 PRO INVITE TRACKER — ULTIMATE EDITION
- * WhoInvited + Pro Stats + Custom Default Message
+ * 🚀 PRO INVITE TRACKER — STABLE EDITION
+ * Fixes: Rate Limit Crash (Opcode 8) & Sync Loop
  *****************************************************************************************/
 
 const {
@@ -37,7 +37,7 @@ const client = new Client({
 
 const inviteCache = new Collection();
 
-// --- 4. DEFAULT MESSAGE (Tumhara Wala) ---
+// --- 4. CONFIG VARS ---
 const DEFAULT_TITLE = "Swagat hai {user}!";
 const DEFAULT_DESC = `You are member **#{count}**! Invited by {inviter}.\n
 📜 **Read Rules:** <#1440014653273931787>
@@ -49,7 +49,6 @@ const DEFAULT_DESC = `You are member **#{count}**! Invited by {inviter}.\n
 
 ✅ **Verify Access:** Paste your Roblox ID in <#1451973498200133786> to access the script.`;
 
-// --- HELPER: FORMAT MESSAGE ---
 function formatMessage(text, member, inviterId, code) {
     if (!text) return "";
     return text
@@ -123,26 +122,28 @@ client.once("ready", async () => {
     await client.application.commands.set(commands);
     console.log("⚡ Slash commands deployed!");
 
-    // CACHE SYNC
+    // CACHE SYNC & MEMBER FETCH (Safe Start)
     for (const guild of client.guilds.cache.values()) {
         try {
-            const invites = await guild.invites.fetch();
-            inviteCache.set(guild.id, new Collection(invites.map(i => [i.code, i.uses])));
+            await guild.invites.fetch().then(invites => {
+                inviteCache.set(guild.id, new Collection(invites.map(i => [i.code, i.uses])));
+            });
+            // Fetch members once at startup to fill cache
+            await guild.members.fetch().catch(() => console.log(`⚠️ Member fetch skipped for ${guild.name}`));
         } catch (e) { console.log(`❌ No perms: ${guild.name}`); }
     }
 });
 
 // --- MEMBER JOIN ---
 client.on("guildMemberAdd", async member => {
-    const newInvites = await member.guild.invites.fetch();
+    const newInvites = await member.guild.invites.fetch().catch(() => new Collection());
     const oldInvites = inviteCache.get(member.guild.id);
-    const usedInvite = newInvites.find(i => i.uses > (oldInvites.get(i.code) || 0));
+    const usedInvite = newInvites.find(i => i.uses > (oldInvites?.get(i.code) || 0));
     inviteCache.set(member.guild.id, new Collection(newInvites.map(i => [i.code, i.uses])));
 
     let inviterId = null; let code = "Unknown";
     if (usedInvite) { inviterId = usedInvite.inviter?.id; code = usedInvite.code; }
 
-    // Save to DB
     if (inviterId) {
         await supabase.from("joins").insert({ guild_id: member.guild.id, user_id: member.id, inviter_id: inviterId, code: code });
         
@@ -156,7 +157,6 @@ client.on("guildMemberAdd", async member => {
             fake_invites: existing?.fake_invites || 0, leaves: existing?.leaves || 0
         });
 
-        // Check Rewards
         await checkRewards(member.guild, inviterId);
     }
 
@@ -166,10 +166,8 @@ client.on("guildMemberAdd", async member => {
     if (config?.welcome_channel) {
         const channel = member.guild.channels.cache.get(config.welcome_channel);
         if (channel) {
-            // Use Custom or Fallback to DEFAULT_DESC (Tumhara text)
             const titleRaw = config.welcome_title || DEFAULT_TITLE;
             const descRaw = config.welcome_desc || DEFAULT_DESC;
-
             const title = formatMessage(titleRaw, member, inviterId, code);
             const desc = formatMessage(descRaw, member, inviterId, code);
 
@@ -202,44 +200,42 @@ client.on("guildMemberRemove", async member => {
 
 // --- INTERACTIONS ---
 client.on("interactionCreate", async interaction => {
-    // SYNC SELECT MENU
+    // SYNC SELECT MENU (FIXED LOGIC)
     if (interaction.isUserSelectMenu() && interaction.customId === 'sync_select_inviter') {
         if (!isAdmin(interaction.member)) return interaction.reply({ content: "❌ Admins only.", ephemeral: true });
+        
         const selectedInviterId = interaction.values[0];
         const targetUserId = interaction.message.embeds[0].footer.text.replace("TargetID: ", "");
         
+        // Defer update immediately to prevent timeout
         await interaction.deferUpdate();
+        
+        // 1. Save to DB
         await supabase.from("joins").insert({ guild_id: interaction.guild.id, user_id: targetUserId, inviter_id: selectedInviterId, code: "manual" });
         
+        // 2. Update Stats
         const { data: existing } = await supabase.from("invite_stats").select("*").eq("guild_id", interaction.guild.id).eq("inviter_id", selectedInviterId).maybeSingle();
         await supabase.from("invite_stats").upsert({
             guild_id: interaction.guild.id, inviter_id: selectedInviterId,
             total_invites: (existing?.total_invites || 0) + 1,
             real_invites: (existing?.real_invites || 0) + 1
         });
+        
+        // 3. Move to next user (NO FETCHING ALL MEMBERS AGAIN)
         await checkNextMissingUser(interaction);
     }
 
     if (!interaction.isChatInputCommand()) return;
 
-    // --- WHO INVITED COMMAND ---
     if (interaction.commandName === "whoinvited") {
         const target = interaction.options.getUser("user");
-        
-        const { data: joinData } = await supabase
-            .from("joins")
-            .select("*")
-            .eq("guild_id", interaction.guild.id)
-            .eq("user_id", target.id)
-            .maybeSingle();
+        const { data: joinData } = await supabase.from("joins").select("*").eq("guild_id", interaction.guild.id).eq("user_id", target.id).maybeSingle();
 
-        if (!joinData) {
-            return interaction.reply({ content: `❌ **${target.username}** ka invite record database me nahi hai. (Shayad bot se pehle join kiya ho).`, ephemeral: true });
-        }
+        if (!joinData) return interaction.reply({ content: `❌ No record found for **${target.username}**.`, ephemeral: true });
 
         const inviterId = joinData.inviter_id;
         const code = joinData.code;
-        const joinDate = `<t:${Math.floor(new Date(joinData.joined_at).getTime() / 1000)}:F>`; // Timestamp
+        const joinDate = `<t:${Math.floor(new Date(joinData.joined_at).getTime() / 1000)}:F>`;
 
         const embed = new EmbedBuilder()
             .setColor('#FFA500')
@@ -249,11 +245,9 @@ client.on("interactionCreate", async interaction => {
                 { name: '🎟️ Code', value: `\`${code}\``, inline: true },
                 { name: '📅 Joined At', value: joinDate, inline: false }
             );
-
         return interaction.reply({ embeds: [embed] });
     }
 
-    // --- INVITES COMMAND (PRO STYLE) ---
     if (interaction.commandName === "invites") {
         const user = interaction.options.getUser("user") || interaction.user;
         const { data } = await supabase.from("invite_stats").select("*").eq("guild_id", interaction.guild.id).eq("inviter_id", user.id).maybeSingle();
@@ -274,22 +268,26 @@ client.on("interactionCreate", async interaction => {
                 { name: '📊 Total', value: `${total}`, inline: true }
             )
             .setFooter({ text: 'Real = Total - Fake - Leaves' });
-        
         return interaction.reply({ embeds: [embed] });
     }
 
-    // --- SYNC MISSING ---
+    // SYNC COMMAND
     if (interaction.commandName === "syncmissing") {
         if (!isAdmin(interaction.member)) return interaction.reply({ content: "❌ Admins only.", ephemeral: true });
-        await interaction.reply({ content: "🔎 Searching...", ephemeral: true });
+        
+        await interaction.reply({ content: "🔎 Searching for missing data...", ephemeral: true });
+        
+        // Fetch ONCE at start of command to ensure we have latest data
+        if (interaction.guild.memberCount > interaction.guild.members.cache.size) {
+            await interaction.guild.members.fetch(); 
+        }
         await checkNextMissingUser(interaction);
     }
 
-    // --- CONFIG COMMANDS ---
+    // CONFIG & LEADERBOARD (Same as before)
     if (interaction.commandName === "config") {
         if (!isAdmin(interaction.member)) return interaction.reply({ content: "❌ Admins only.", ephemeral: true });
         const sub = interaction.options.getSubcommand();
-
         if (sub === "setchannel") {
             const ch = interaction.options.getChannel("channel");
             await supabase.from("guild_config").upsert({ guild_id: interaction.guild.id, welcome_channel: ch.id });
@@ -299,13 +297,8 @@ client.on("interactionCreate", async interaction => {
             const title = interaction.options.getString("title");
             const desc = interaction.options.getString("description");
             const { data: existing } = await supabase.from("guild_config").select("welcome_channel").eq("guild_id", interaction.guild.id).maybeSingle();
-            await supabase.from("guild_config").upsert({ 
-                guild_id: interaction.guild.id, 
-                welcome_channel: existing?.welcome_channel, 
-                welcome_title: title, 
-                welcome_desc: desc 
-            });
-            return interaction.reply(`✅ **Message Updated!** Use \`{count}\` for member number.`);
+            await supabase.from("guild_config").upsert({ guild_id: interaction.guild.id, welcome_channel: existing?.welcome_channel, welcome_title: title, welcome_desc: desc });
+            return interaction.reply(`✅ **Message Updated!**`);
         }
         if (sub === "addreward") {
             const invites = interaction.options.getInteger("invites");
@@ -315,7 +308,6 @@ client.on("interactionCreate", async interaction => {
         }
     }
 
-    // --- LEADERBOARD ---
     if (interaction.commandName === "leaderboard") {
         const { data } = await supabase.from("invite_stats").select("*").eq("guild_id", interaction.guild.id).order("real_invites", { ascending: false }).limit(10);
         const lb = data?.map((u, i) => `**#${i + 1}** <@${u.inviter_id}> : **${u.real_invites}**`).join("\n") || "No data.";
@@ -323,12 +315,17 @@ client.on("interactionCreate", async interaction => {
     }
 });
 
-// --- HELPER: SYNC ---
+// --- HELPER: SYNC (Optimized: Uses Cache) ---
 async function checkNextMissingUser(interactionOrMessage) {
     const guild = interactionOrMessage.guild;
-    const members = await guild.members.fetch();
+    
+    // IMPORTANT: Use cache instead of fetching all members again
+    const members = guild.members.cache; 
+    
     const { data: joins } = await supabase.from("joins").select("user_id").eq("guild_id", guild.id);
     const recordedIds = new Set(joins?.map(j => j.user_id));
+    
+    // Find missing member
     const missingMember = members.find(m => !m.user.bot && !recordedIds.has(m.id));
 
     if (!missingMember) {
@@ -349,7 +346,6 @@ async function checkNextMissingUser(interactionOrMessage) {
     else await interactionOrMessage.update({ content: null, embeds: [embed], components: [row] });
 }
 
-// --- HELPER: REWARDS ---
 async function checkRewards(guild, inviterId) {
     const { data: stats } = await supabase.from("invite_stats").select("*").eq("guild_id", guild.id).eq("inviter_id", inviterId).maybeSingle();
     if (!stats) return;
@@ -369,7 +365,7 @@ async function checkRewards(guild, inviterId) {
     }
 }
 
-// EVENTS
+// EVENTS & ANTI-CRASH
 client.on('inviteCreate', (invite) => {
     const invites = inviteCache.get(invite.guild.id);
     if (invites) invites.set(invite.code, invite.uses);
@@ -377,6 +373,17 @@ client.on('inviteCreate', (invite) => {
 client.on('inviteDelete', (invite) => {
     const invites = inviteCache.get(invite.guild.id);
     if (invites) invites.delete(invite.code);
+});
+
+// SAFETY NET (ANTI-CRASH)
+process.on('unhandledRejection', (reason, p) => {
+    console.log(' [Anti-Crash] Unhandled Rejection/Error:', reason);
+});
+process.on('uncaughtException', (err, origin) => {
+    console.log(' [Anti-Crash] Uncaught Exception:', err);
+});
+process.on('uncaughtExceptionMonitor', (err, origin) => {
+    console.log(' [Anti-Crash] Uncaught Exception Monitor:', err);
 });
 
 client.login(process.env.TOKEN);
